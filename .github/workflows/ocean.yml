@@ -1,0 +1,21 @@
+# psarema-data: rebuilds ocean.json (build.mjs) three times a day and publishes it on GitHub Pages (branch gh-pages, one commit,
+# force-pushed so the repo never grows). The push also counts as activity, so GitHub does not pause the schedule after 60 quiet days.
+name: ocean
+on:
+  schedule: [{ cron: '15 5,13,21 * * *' }]
+  workflow_dispatch:
+permissions: { contents: write }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: node build.mjs site
+      - run: |
+          cd site && touch .nojekyll
+          git init -q -b gh-pages && git add -A
+          git -c user.name=psarema-data -c user.email=actions@users.noreply.github.com commit -q -m "ocean $(date -u '+%F %H:%M')"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
