@@ -2,6 +2,10 @@
 // the app's 10 timeline days (2 back, today, 7 ahead). Read from the public ARCO Zarr stores (no account), cut to the Cyprus box and
 // packed into one small JSON. Runs once a day in the psarema-data repo (GitHub Actions, workflow.yml); js/sources.js loadOcean() reads it.
 //   node build.mjs [outDir]          -> outDir/ocean.json (~0.5 MB; GitHub Pages serves it gzipped, ~0.2 MB)
+//                                    -> outDir/surface.json (round 10, ~0.5 MB): the satellite sea surface cut to the same box, so the phone
+//                                       loads one small file instead of ~5 MB of Zarr chunks: sea temperature (L4, 0.01°), its anomaly
+//                                       against 1991-2020 (1/16°) and chlorophyll (L4 gap-free, 1 km).
+//                                       js/sources.js loadSurface() reads it; without it (or older than 3 days) the app reads the stores itself.
 // Data: E.U. Copernicus Marine Service, MEDSEA_ANALYSISFORECAST_PHY_006_013 (4.2 km, daily means); Copernicus Marine licence (attribution).
 import { mkdirSync, writeFileSync } from 'node:fs';
 
@@ -64,7 +68,7 @@ async function open(url) {
   };
   const meta = JSON.parse(new TextDecoder().decode(await get('.zmetadata'))).metadata;
   const dec = (name, buf) => new DTYPE[meta[name + '/.zarray'].dtype](blosc(buf).buffer);
-  const axis = async name => Array.from(dec(name, await get(`${name}/0`)), Number);
+  const axis = async name => { const a = meta[name + '/.zarray'], out = []; for (let c = 0; c * a.chunks[0] < a.shape[0]; c++) out.push(...Array.from(dec(name, await get(`${name}/${c}`)), Number)); return out.slice(0, a.shape[0]); };
   const [lat, lon] = await Promise.all([axis('latitude'), axis('longitude')]);
   const span = (ax, a, b) => [ax.findIndex(x => x >= a), ax.findLastIndex(x => x <= b)];
   const [y0, y1] = span(lat, BOX[0], BOX[2]), [x0, x1] = span(lon, BOX[1], BOX[3]), ny = y1 - y0 + 1, nx = x1 - x0 + 1;
@@ -128,3 +132,32 @@ const dir = process.argv[2] || '.';
 mkdirSync(dir, { recursive: true });
 writeFileSync(`${dir}/ocean.json`, JSON.stringify(out));
 console.log(`ocean.json: ${out.dates[0]}..${out.dates.at(-1)}, ${n} cells × ${L} depths, ${(JSON.stringify(out).length / 1024).toFixed(0)} kB`);
+
+/* ---------- surface.json: the satellite surface maps (a failure here leaves ocean.json published and the app on its own downloads) ---------- */
+try {
+  const CM = 'https://s3.waw3-1.cloudferro.com/', SST = 'mdl-arco-time-046/arco/SST_MED_SST_L4_NRT_OBSERVATIONS_010_004/';
+  const SRC = { // the same stores as js/sources.js ARCO and js/ocean.js SRC (timeChunked: one day of the whole sea per chunk)
+    sst: [CM + SST + 'SST_MED_SST_L4_NRT_OBSERVATIONS_010_004_c_V2_202311/timeChunked.zarr', 'analysed_sst', -273.15],
+    anom: [CM + SST + 'SST_MED_SSTA_L4_NRT_OBSERVATIONS_010_004_b_202607/timeChunked.zarr', 'sst_anomaly', 0],
+    chl: [CM + 'mdl-arco-time-045/arco/OCEANCOLOUR_MED_BGC_L4_NRT_009_142/cmems_obs-oc_med_bgc-plankton_nrt_l4-gapfree-multi-1km_P1D_202207/timeChunked.zarr', 'CHL', 0],
+  };
+  const latest = async k => { // the newest uploaded day (the last step can be listed a little before its chunks arrive)
+    const [url, v, add] = SRC[k], st = await open(url);
+    for (let t = st.last; t >= st.last - 2; t--) {
+      try { const g = await st.grid(v, t, 0); return { st, t, g: add ? g.map(x => x + add) : g }; }
+      catch (e) { if (e.status !== 403 && e.status !== 404) throw e; }
+    }
+    throw new Error(k + ': no recent day');
+  };
+  const head = ({ st, t }) => ({ date: st.date(t), lat0: st.lat[st.y0], dLat: st.lat[st.y0 + 1] - st.lat[st.y0], lon0: st.lon[st.x0], dLon: st.lon[st.x0 + 1] - st.lon[st.x0], ny: st.ny, nx: st.nx });
+  const q = (g, T, f, none, lo, hi) => { const a = new T(g.length); for (let i = 0; i < g.length; i++) a[i] = Number.isNaN(g[i]) ? none : Math.max(lo, Math.min(hi, Math.round(f(g[i])))); return b64(a); };
+  const [s0, an, ch] = await Promise.all([latest('sst'), latest('anom').catch(e => (console.warn('surface anomaly:', e.message), null)), latest('chl').catch(e => (console.warn('surface chlorophyll:', e.message), null))]);
+  const surf = { made: new Date().toISOString(), source: 'E.U. Copernicus Marine Service Information: SST_MED_SST_L4_NRT_OBSERVATIONS_010_004, OCEANCOLOUR_MED_BGC_L4_NRT_009_142',
+    sst: { ...head(s0), res: '1 km', q: q(s0.g, Int16Array, v => v * 100, -32768, -32767, 32767) }, // °C × 100, −32768 = land / none
+    ...(an && { anom: { ...head(an), res: '7 km', q: q(an.g, Int8Array, v => v * 10, -128, -127, 127) } }), // °C × 10 against the 1991-2020 day of the year
+    ...(ch && { chl: { ...head(ch), res: '1 km', q: q(ch.g, Uint16Array, v => (Math.log10(Math.max(v, 1e-3)) + 2.5) * 1e4, 65535, 0, 65534) } }) }; // log10(mg/m³): (x + 2.5) × 10000, 65535 = none (fine steps: the app takes fronts from its gradient)
+  const ok = s0.g.filter(v => !Number.isNaN(v)), mn = ok.reduce((a, v) => Math.min(a, v), 99), mx = ok.reduce((a, v) => Math.max(a, v), -99);
+  if (!(ok.length > 20000 && mn > 12 && mx < 33)) throw new Error(`surface.json looks wrong: ${ok.length} sea cells, ${mn}..${mx} °C`);
+  writeFileSync(`${dir}/surface.json`, JSON.stringify(surf));
+  console.log(`surface.json: sst ${surf.sst.date} (${surf.sst.ny}×${surf.sst.nx}, ${mn.toFixed(1)}..${mx.toFixed(1)} °C), anomaly ${surf.anom?.date || 'no'}, chlorophyll ${surf.chl?.date || 'no'}, ${(JSON.stringify(surf).length / 1024).toFixed(0)} kB`);
+} catch (e) { console.warn('surface.json not built:', e.message); }
