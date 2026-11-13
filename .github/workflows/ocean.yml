@@ -14,6 +14,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: node build.mjs site
+      - run: cp -r area3d site/   # the 3D area packs (Psarema js/area3d.js downloads them on first open)
       - run: |
           cd site && touch .nojekyll
           git init -q -b gh-pages && git add -A
