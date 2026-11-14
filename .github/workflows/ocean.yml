@@ -20,3 +20,17 @@ jobs:
           git init -q -b gh-pages && git add -A
           git -c user.name=psarema-data -c user.email=actions@users.noreply.github.com commit -q -m "ocean $(date -u '+%F %H:%M')"
           git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+      # Round 15: the last 45 days' forecasts (ocean.json, currents.json; a folder per day, the day's last run wins) on branch `archive`, so the
+      # errors by lead time can be measured against floats later (Psarema scripts/ocean/verify.mjs). One orphan commit, force-pushed: the repo
+      # does not grow. It runs after the publish and cannot fail the job; an unreadable branch skips the step instead of starting it afresh.
+      - name: archive
+        continue-on-error: true
+        run: |
+          r="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" d=$(date -u +%F) s=0
+          mkdir arc && cd arc && git init -q -b archive
+          git ls-remote --exit-code "$r" refs/heads/archive > /dev/null || s=$?
+          if [ $s = 0 ]; then git fetch -q --depth 1 "$r" archive && git checkout -q FETCH_HEAD -- .; elif [ $s != 2 ]; then exit 1; fi
+          rm -rf "$d" && mkdir "$d" && cp ../site/ocean.json ../site/currents.json "$d"/
+          ls -d 20??-??-?? | head -n -45 | xargs -r rm -rf
+          git add -A && git -c user.name=psarema-data -c user.email=actions@users.noreply.github.com commit -q -m "forecasts to $d"
+          git push -q -f "$r" HEAD:archive
